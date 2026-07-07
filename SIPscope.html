@@ -150,6 +150,9 @@ button{font-family:inherit;cursor:pointer;color:inherit}
 .mini{font-size:10px;padding:3px 6px;border-radius:5px;border:1px solid var(--border-soft);background:var(--bg-3);color:var(--text-dim);font-family:var(--mono)}
 .mini:hover{color:var(--text);border-color:var(--border)}
 .badge{font-family:var(--mono);font-size:11px;font-weight:700;padding:2px 7px;border-radius:5px;white-space:nowrap;border:1px solid transparent;line-height:1.45}
+.legb{font-family:var(--mono);font-size:8.5px;font-weight:700;padding:1px 4px;border-radius:4px;margin-left:4px;letter-spacing:.05em;vertical-align:middle}
+.legb.access{color:var(--accent-2);border:1px solid var(--accent-2);opacity:.85}
+.legb.core{color:var(--text-faint);border:1px solid var(--border)}
 
 .ctools{flex:none;padding:9px 14px;border-bottom:1px solid var(--border);display:flex;gap:10px;align-items:center;flex-wrap:wrap;background:var(--bg-2)}
 .focuspill{font-family:var(--mono);font-size:11px;padding:5px 9px;border-radius:7px;background:var(--bg);border:1px solid var(--border);display:flex;gap:8px;align-items:center;color:var(--text-dim)}
@@ -570,6 +573,134 @@ const H248_ERR = {
   "542":{t:"Command is not allowed on this termination.",sev:2},
   "581":{t:"Does Not Exist.",sev:2}
 };
+// Diameter result codes seen on the SBC's policy (Gq'/Rx toward PCRF) and Cx/Sh interfaces.
+// Real Nokia traces embed these in teardown reasons, e.g.
+//   Reason: SIP;cause=503;text="PO: AAA: result_code=0 exp_result_code=5021"
+// meaning the policy server refused media/bearer authorization — the call dies with a 503
+// even though SIP itself was fine.
+const DIAM_KB={
+  "3001":"UNSUPPORTED_COMMAND","3002":"UNABLE_TO_DELIVER \u2014 no route to the Diameter peer (peer down / realm routing)","3003":"REALM_NOT_SERVED","3004":"TOO_BUSY \u2014 the Diameter server is overloaded","3005":"LOOP_DETECTED","3006":"REDIRECT_INDICATION","3007":"APPLICATION_UNSUPPORTED","3008":"INVALID_HDR_BITS","3009":"INVALID_AVP_BITS","3010":"UNKNOWN_PEER",
+  "4001":"AUTHENTICATION_REJECTED","4002":"OUT_OF_SPACE","4003":"ELECTION_LOST",
+  "5001":"AVP_UNSUPPORTED","5002":"UNKNOWN_SESSION_ID \u2014 the policy server lost the session (restart / session desync)","5003":"AUTHORIZATION_REJECTED \u2014 the policy server refused to authorize this request","5004":"INVALID_AVP_VALUE","5005":"MISSING_AVP","5006":"RESOURCES_EXCEEDED","5007":"CONTRADICTING_AVPS","5008":"AVP_NOT_ALLOWED","5009":"AVP_OCCURS_TOO_MANY_TIMES","5010":"NO_COMMON_APPLICATION","5011":"UNSUPPORTED_VERSION","5012":"UNABLE_TO_COMPLY \u2014 generic policy-server refusal","5013":"INVALID_BIT_IN_HEADER","5014":"INVALID_AVP_LENGTH","5015":"INVALID_MESSAGE_LENGTH","5016":"INVALID_AVP_BIT_COMBO","5017":"NO_COMMON_SECURITY",
+  "5021":"Rx/Gq' policy: session/bearer authorization rejected (IP-CAN session not available or initial parameters invalid) \u2014 the PCRF/policy server would not authorize media for this call",
+  "5061":"INVALID_SERVICE_INFORMATION (Rx) \u2014 PCRF rejected the media description","5062":"FILTER_RESTRICTIONS (Rx)","5063":"REQUESTED_SERVICE_NOT_AUTHORIZED (Rx) \u2014 subscriber not allowed this service","5064":"DUPLICATED_AF_SESSION (Rx)","5065":"IP-CAN_SESSION_NOT_AVAILABLE (Rx) \u2014 no underlying bearer/IP session for this subscriber (device lost its data session)","5066":"UNAUTHORIZED_NON_EMERGENCY_SESSION (Rx)","5067":"UNAUTHORIZED_SPONSORED_DATA_CONNECTIVITY (Rx)"
+};
+// ===== Google FCM HTTP v1 API knowledge (Nokia FDD SBCSST-6472) =====
+// The newer Google push interface: HTTP/2 POST to fcm.googleapis.com/v1/projects/<id>/messages:send,
+// authorized with a short-lived OAuth Bearer token. FCM's JSON error "status" and the HTTP status
+// code together tell you the cause AND whether the SBC will retry. This is the decisive part for
+// debugging HTTPS push: a no-retry code means the device will NOT be reached on this attempt.
+const FCM_V1_ERR={
+  "400":{status:"INVALID_ARGUMENT",retry:false,sev:3,short:"Bad request \u2014 the SBC built an invalid push",
+    t:"FCM rejected the request parameters. Causes: malformed/truncated registration token, payload too big (>4096 bytes), invalid TTL (must be 0\u20132419200s), a reserved data key (from/gcm/google\u2026), or an invalid package name. No retry \u2014 the SBC keeps the SIP request parked and it will eventually time out.",
+    tips:["Check the FCM registration token the client sent in REGISTER (P-Com.NS-Info:FCM=\u2026) \u2014 it must be passed verbatim, not truncated.","Check total payload size (keys+values) is under 4096 bytes \u2014 large PAI/History-Info/SDP can push it over.","Confirm ttl is an integer-seconds string like \"0s\" and the package name matches the token."]},
+  "401":{status:"THIRD_PARTY_AUTH_ERROR",retry:false,sev:3,short:"Auth error (APNs cert / web push key)",
+    t:"Credential problem at the push service. For FCM-to-Android this is unusual; it normally applies to APNs-cert or web-push keying. Verify the FCM credentials / access token.",
+    tips:["Verify the OAuth access token is valid and unexpired (see any FCM Token fetch errors).","For iOS-over-FCM, check the APNs auth key/cert validity."]},
+  "403":{status:"SENDER_ID_MISMATCH",retry:false,sev:3,short:"Sender/project mismatch \u2014 misconfiguration",
+    t:"The authenticated sender (project) is not one the device's token is registered to. The registration token is tied to a specific set of sender IDs; using a different project's token/credentials fails permanently. No retry.",
+    tips:["Check the Android Application \u2192 FCM Project mapping: the app/service in the client's P-Com.Service header must map to the SAME project whose Service Account Key signed this push.","A token minted for OneTalk won't work if sent under the Message+ project (or vice-versa)."]},
+  "404":{status:"UNREGISTERED",retry:false,sev:3,short:"Token dead \u2014 device unregistered from FCM",
+    t:"The device's FCM registration token is no longer valid \u2014 the app was uninstalled, the token expired, or the client unregistered. This is NOT a sleeping-device problem: calls to this device will fail until the client re-registers a fresh token. No retry.",
+    tips:["The client must obtain a NEW FCM token and re-REGISTER it \u2014 the old one is permanently dead.","If many subscribers show 404 at once, suspect a token-refresh event or an app update that changed messaging config.","Remove the stale token from the app server; continuing to send to it just wastes attempts."]},
+  "429":{status:"QUOTA_EXCEEDED",retry:"backoff",sev:3,short:"Rate-limited by FCM (quota)",
+    t:"FCM is throttling. Per the SBC design, on a 429 the P-CSCF stops sending on that HTTPS/2 connection for one minute; if EVERY connection is in its one-minute block and the max connection count is reached, pushes are dropped entirely and the VS.PCSCFFCMPOSTBlockQuota count is pegged. This is a network-wide condition, not a per-device fault.",
+    tips:["Expect many subscribers to fail together \u2014 this is an operator/capacity issue, not a bad token.","Check the FCM POST error rate and whether 'Allocate more ports for PN server connections' is enabled (raises the per-app connection limit from 3 to 10).","Google requires exponential backoff (\u22651 min initial) \u2014 sustained 429s risk denylisting."]},
+  "500":{status:"INTERNAL",retry:true,sev:2,short:"FCM internal error (SBC retries once)",
+    t:"An unknown error inside FCM. The SBC retries once (same connection) after the Retry-After delay, or 1 second if no Retry-After header. If the retry also fails, the SIP request is left to time out.",
+    tips:["Usually transient \u2014 confirm a retry followed and whether it succeeded.","If persistent across many pushes, it's an FCM-side problem; correlate timing with the FCM POST error-rate alarm."]},
+  "503":{status:"UNAVAILABLE",retry:true,sev:2,short:"FCM overloaded (SBC retries once)",
+    t:"FCM is overloaded and couldn't process the request in time. The SBC retries once, honoring the Retry-After header if present (else a 1-second delay). Retry uses the same connection for 503.",
+    tips:["Check for a Retry-After header and that the retry respected it.","Transient if isolated; if widespread, FCM capacity or the path to it is the issue."]}
+};
+// FCM timeout / no-response isn't an HTTP code but behaves like one: the SBC retries once on a NEW connection.
+const FCM_V1_TIMEOUT={retry:true,sev:2,short:"No response from FCM (timeout \u2014 SBC retries on a new connection)",
+  t:"The POST got no response within the POST Response Wait Time (default 20s). The SBC opens a new HTTPS/2 connection and retries once. If that also times out, the SIP request is left to expire.",
+  tips:["Check the path to fcm.googleapis.com (DNS, firewall, TLS) around this time.","A single timeout is usually transient; repeated timeouts point at connectivity to FCM."]};
+// OAuth token acquisition (AFED/FEPH -> oauth2.googleapis.com/token). If there is no valid token,
+// the SBC skips the FCM POST entirely — a distinct failure that looks like a wake-up failure but is
+// really a credential/OAuth problem with a completely different fix.
+const FCM_OAUTH={
+  markers:/oauth2\.googleapis\.com|accounts\.google\.com\/o\/oauth2|token_uri|\/o\/oauth2\/token|GOOGLE_APPLICATION_CREDENTIALS|service_account|JWT|access_token is |grant_type|assertion=/i,
+  errMarkers:/(invalid_grant|invalid_client|unauthorized_client|invalid_scope|invalid_request)|token.{0,20}(expired|missing|unavailable|fail\w*)|no\s+(valid\s+)?access\s+token|unable to (get|obtain|refresh).{0,20}token|skip\w*\s+.{0,20}POST/i
+};
+// FCM/OAuth performance counters and alarms named in the FDD. If any appear in a log or a pasted
+// PM report, decode what they measure and what a non-zero value means.
+const FCM_PM={
+  "VS.ConcurFCMConnect":"Concurrent connections with FCM (per IMS service) \u2014 open HTTPS/2 (or legacy XMPP) connections to FCM right now.",
+  "VS.PCSCFFCMConnectAtt":"FCM Connection Attempt \u2014 P-CSCF tried to open a connection to FCM.",
+  "VS.PCSCFFCMConnectError":"FCM Connection Error \u2014 opening a connection to FCM failed.",
+  "VS.PCSCFFCMPOSTAtt":"FCM POST Attempt \u2014 a push POST was sent to FCM (HTTP v1). Non-zero is normal.",
+  "VS.PCSCFFCMPOSTError":"FCM POST Error \u2014 a push POST failed: connect failure, any error response, or timeout. Watch the ratio to POST Attempt.",
+  "VS.PCSCFFCMPOSTAttPST":"FCM POST Attempt per Service Type \u2014 POST attempts broken out per app/service.",
+  "VS.PCSCFFCMPOSTErrorPST":"FCM POST Error per Service Type \u2014 POST failures per app/service (isolates one broken app).",
+  "VS.PCSCFFCMPOSTBlockQuota":"FCM POST Blocked due to Quota \u2014 a push could not be sent because every FCM connection was in its post-429 one-minute block. Network-wide throttling indicator.",
+  "VS.FEPHFCMTokenAtt":"FCM Token Attempt (FEPH) \u2014 an OAuth access-token request was sent to the Google OAuth server.",
+  "VS.FEPHFCMTokenError":"FCM Token Error (FEPH) \u2014 an OAuth token request failed (bad response, connect failure, or timeout). If non-zero, pushes may be skipped for lack of a token.",
+  "VS.PCSCFFCMXMPPAtt":"FCM XMPP Attempt (legacy) \u2014 push sent over the older XMPP interface.",
+  "VS.PCSCFFCMXMPPError":"FCM XMPP Error (legacy) \u2014 XMPP push failed.",
+  "VS.PCSCFFCMXMPPAttPST":"FCM XMPP Attempt per Service Type (legacy).",
+  "VS.PCSCFFCMXMPPErrorPST":"FCM XMPP Error per Service Type (legacy)."
+};
+const FCM_ALARMS={
+  "LSS_missingFCMAuthData":{sev:3,t:"Missing FCM authentication data \u2014 the FCM CA certificate, or the client credentials (the Service Account Private Key file for HTTP v1, or server-key+sender-id for XMPP), is not installed for an app; OR no OAuth access token is available (couldn't get/refresh a token). No connection to FCM can be made for that app, so NO Android pushes go out.",
+    tips:["Confirm the Service Account Private Key file is installed for the app (HTTP v1) and the FCM root CA is installed and linked to the IMS Service.","Check the OAuth token fetch is succeeding (FCM Token Error count / oauth2.googleapis.com responses).","This alarm means push is broken platform-wide for that app \u2014 fix before chasing individual calls."]},
+  "FCMPOSTReqErrRate":{sev:2,t:"FCM POST Request Error Rate CPI \u2014 the percentage of FCM POST pushes that failed over the last 5 minutes exceeded threshold (Warning >10%, Minor >20%, Major >30%). Indicates a systemic problem sending to FCM (connectivity, TLS, or FCM-side).",
+    tips:["Look at whether failures are connection errors, specific HTTP codes, or timeouts to localize the cause.","Only calculated once volume is \u22651000 POSTs, so it reflects a real trend, not a blip."]},
+  "LSS_cpiFCMXMPPReqErrRate":{sev:2,t:"Legacy XMPP POST/message error-rate CPI (older interface equivalent of FCMPOSTReqErrRate)."}
+};
+// Decode an FCM v1 error out of a log line: HTTP :status 4xx/5xx and/or the JSON "status"/"error" name.
+function fcmV1Decode(text){
+  if(!text) return null;
+  let code=null;
+  const st=/Header:\s*:status:\s*(\d{3})/i.exec(text) || /"code"\s*:\s*(\d{3})/.exec(text);
+  if(st) code=st[1];
+  const nameM=/"status"\s*:\s*"([A-Z_]+)"|\berror\b["'\s:]+([A-Z_]{5,})/.exec(text);
+  const name=nameM?(nameM[1]||nameM[2]):null;
+  if(code && FCM_V1_ERR[code] && (!name || name===FCM_V1_ERR[code].status || /2\d\d/.test(code)===false)) return Object.assign({code},FCM_V1_ERR[code]);
+  if(name){ for(const k in FCM_V1_ERR){ if(FCM_V1_ERR[k].status===name) return Object.assign({code:k},FCM_V1_ERR[k]); } }
+  if(code && /^[45]\d\d$/.test(code)) return {code,status:"",retry:(code==="500"||code==="503"),sev:code[0]==="5"?2:3,short:"FCM returned HTTP "+code,t:"FCM returned HTTP "+code+" to the push POST.",tips:[]};
+  return null;
+}
+// Decode an FCM/OAuth PM counter or alarm token appearing in a log line.
+function fcmGlossary(text){
+  if(!text) return null;
+  for(const k in FCM_ALARMS){ if(text.indexOf(k)>=0) return {kind:"alarm",name:k,info:FCM_ALARMS[k]}; }
+  for(const k in FCM_PM){ if(text.indexOf(k)>=0) return {kind:"pm",name:k,info:{t:FCM_PM[k]}}; }
+  return null;
+}
+// Common failure-cause database, distilled from real Nokia SBC traces. Each entry matches a
+// failed call's evidence (response codes + Reason headers + context) and yields a diagnosis.
+// Checked in order; first match wins for the headline, others append.
+const FAIL_DB=[
+  {id:"policy_aaa",
+   test:c=>c.reasons.some(r=>/(PO|PT):\s*AAA/i.test(r)),
+   sev:3,kind:"policy",
+   title:c=>{const m=/exp_result_code=(\d+)/.exec(c.reasons.find(r=>/AAA/.test(r))||""); const code=m?m[1]:null;
+     return "Policy server rejected media authorization"+(code?(" \u2014 Diameter "+code+(DIAM_KB[code]?" ("+DIAM_KB[code].split(" \u2014 ")[0]+")":"")):"");},
+   text:c=>{const r=c.reasons.find(x=>/AAA/.test(x))||""; const m=/exp_result_code=(\d+)/.exec(r); const code=m?m[1]:null;
+     return "The call was torn down by the SBC's policy interface (Gq'/Rx toward the PCRF): "+r+(code&&DIAM_KB[code]?(" \u2014 "+DIAM_KB[code]):"")+". SIP signaling was fine; the bearer/QoS authorization failed.";}},
+  {id:"user_notfound",
+   test:c=>(c.codes.has(404))||c.reasons.some(r=>/cause=1\b.*user not found/i.test(r)),
+   sev:3,kind:"routing",
+   title:()=>"User / number not found (404, Q.850 cause 1)",
+   text:c=>"The target was not found"+(c.reasons.some(r=>/user not found/i.test(r))?" \u2014 the network reported Q.850 cause 1 (unallocated number / user not found)":"")+". Either the number isn't provisioned/registered at the next hop, or number normalization broke between legs. If the callee is a mobile app, check whether it lost its registration (see any reginfo 'unregistered' NOTIFY around this time)."},
+  {id:"reg_terminated",
+   test:c=>c.regEvts.some(e=>e!=="active"),
+   sev:2,kind:"reg",
+   title:c=>"Registration-state event: "+c.regEvts.filter(e=>e!=="active").join(", "),
+   text:c=>"A reginfo NOTIFY in this dialog reported the binding as '"+c.regEvts.filter(e=>e!=="active").join("', '")+"'. The device's registration was terminated or expired \u2014 calls to it will fail (404/480) until it re-registers. Check why: network loss, de-registration, or registrar-side removal."},
+  {id:"caller_hangup",
+   test:c=>c.codes.has(487)&&c.methods.has("CANCEL"),
+   sev:0,kind:"info",
+   title:()=>"Caller abandoned (CANCEL \u2192 487)",
+   text:()=>"The caller hung up before answer \u2014 the INVITE was CANCELed and answered 487. Usually a human giving up (long ring, wrong number). Only investigate if it correlates with long post-dial delay or a dead push wake-up."},
+  {id:"svc_unavail",
+   test:c=>c.codes.has(503),
+   sev:3,kind:"call",
+   title:c=>{const r=c.reasons.find(x=>/503/.test(x)); return "503 Service Unavailable"+(r?" \u2014 "+r.slice(0,60):"");},
+   text:()=>"A downstream element declined the call (overload, maintenance, or resource failure). Check the Reason header for the true source \u2014 a 'PO:/PT: AAA' text means it's really a policy-authorization failure, not capacity."}
+];
 
 /* ===================== color helpers ===================== */
 function callColor(cid){
@@ -618,12 +749,29 @@ function parserWorker(){
     if(!line) return null;
     const recv=/^\s*RECEIVED\b/i.test(line), send=/^\s*SENDING\b/i.test(line);
     if(!recv && !send) return null;
+    const pm=/\bover\s+(TLS|TCP|UDP|WSS?|SCTP|DTLS)\b/i.exec(line);
+    const proto=pm?pm[1].toUpperCase():"";
     const toks=[]; const re=/\[([0-9a-fA-F:.]+)\]:(\d+)|(\d{1,3}(?:\.\d{1,3}){3}):(\d+)/g; let m;
-    while((m=re.exec(line))){ const a=m[1]||m[3], p=m[2]||m[4]; toks.push(a.indexOf(":")>=0?("["+a+"]:"+p):(a+":"+p)); }
-    if(recv) return {dir:"recv", src:toks[0]||"", dst:toks[1]||""};
-    let dst=toks[1]||"";
+    while((m=re.exec(line))){ const a=m[1]||m[3], p=m[2]||m[4]; toks.push({t:a.indexOf(":")>=0?("["+a+"]:"+p):(a+":"+p), a, p:parseInt(p,10)}); }
+    if(recv) return {dir:"recv", src:toks[0]?toks[0].t:"", dst:toks[1]?toks[1].t:"", proto, remote:toks[0]||null, local:toks[1]||null};
+    let dst=toks[1]?toks[1].t:"";
     if(!toks.length){ const h=/\bto\s+([A-Za-z0-9][A-Za-z0-9.\-]+)(?:\(\d+\))?/i.exec(line); if(h) dst=h[1]; }
-    return {dir:"sent", src:toks[0]||"", dst};
+    return {dir:"sent", src:toks[0]?toks[0].t:"", dst, proto, remote:toks[1]||null, local:toks[0]||null};
+  }
+  // Classify which side of the SBC a wire event belongs to.
+  // Learned from real Nokia traces: the ACCESS leg is the device side - TLS/WSS with the
+  // remote endpoint on a high ephemeral port (the phone behind NAT); the CORE leg runs
+  // between well-known SIP ports (5060/5061) and/or over internal link-local addressing.
+  function classifyLeg(w){
+    if(!w) return "";
+    const r=w.remote, l=w.local;
+    const wellKnown=p=>p>=5060&&p<=5091;
+    if(r&&/^169\.254\./.test(r.a)) return "core";
+    if(l&&/^169\.254\./.test(l.a)&&r&&wellKnown(r.p)) return "core";
+    if(r&&l&&wellKnown(r.p)&&wellKnown(l.p)) return "core";
+    if((w.proto==="TLS"||w.proto==="WSS"||w.proto==="WS")&&r&&!wellKnown(r.p)) return "access";
+    if(r&&l&&!wellKnown(r.p)&&wellKnown(l.p)) return "access";
+    return "";
   }
 
   function finalize(cur,out){
@@ -631,8 +779,8 @@ function parserWorker(){
     const sdp=cur._sdp;
     out.push({i:out.length,s:cur.s,e:cur.e,ln:cur.ln,t:cur.t,k:cur.k,m:cur.method,c:cur.code,rt:cur.rtext,
       cid:cur.cid||"(no Call-ID)",cseq:cur.cseqNum,cm:cur.cseqMethod,fu:cur.fromU,ft:cur.fromT,tu:cur.toU,tt:cur.toT,
-      via:cur.via,src:cur.src,dst:cur.dst,dir:cur.dir,ruri:cur.ruri,se:cur.se,rsn:cur.rsn,push:!!cur.push,ua:cur.ua,
-      exp:(cur.exp!=null?cur.exp:(cur.cexp!=null?cur.cexp:null)),ctU:cur.ctU||"",inst:cur.inst||"",
+      via:cur.via,src:cur.src,dst:cur.dst,dir:cur.dir,leg:cur.leg||"",proto:cur.proto||"",ruri:cur.ruri,se:cur.se,rsn:cur.rsn,push:!!cur.push,ua:cur.ua,
+      exp:(cur.exp!=null?cur.exp:(cur.cexp!=null?cur.cexp:null)),ctU:cur.ctU||"",inst:cur.inst||"",regevt:cur.regevt||"",
       sdp:(sdp&&sdp.has)?{dir:sdp.dir,conn:sdp.conn,aport:sdp.aport,savp:sdp.savp,codecs:sdp.codecs.slice(0,8)}:null});
   }
 
@@ -664,8 +812,8 @@ function parserWorker(){
         finalize(cur,out);
         const prefix=sipIdx>0?text.slice(0,sipIdx):"";
         let ts=findTs(prefix)||recentMetaTs||"";
-        let src="",dst="",dir="";
-        if(wire){ src=wire.src; dst=wire.dst; dir=wire.dir; }
+        let src="",dst="",dir="",leg="",proto="";
+        if(wire){ src=wire.src; dst=wire.dst; dir=wire.dir; leg=classifyLeg(wire); proto=wire.proto; }
         else{
           const scope=prefix+" "+recentMeta+" "+recentMeta2;
           const sd=SRCDST.exec(scope);
@@ -681,7 +829,7 @@ function parserWorker(){
             if(dstm) dst=dstm[1]+(dstm[2]?":"+dstm[2]:"");
           }
         }
-        cur={s:absStart,e:absEnd,ln:lineNo,t:ts,src,dst,dir,k:isReq?"req":"res",method:isReq?sip.method:"",ruri:isReq?sip.ruri:"",
+        cur={s:absStart,e:absEnd,ln:lineNo,t:ts,src,dst,dir,leg,proto,k:isReq?"req":"res",method:isReq?sip.method:"",ruri:isReq?sip.ruri:"",
           code:isReq?null:sip.code,rtext:isReq?"":sip.rtext,cid:"",cseqNum:null,cseqMethod:"",fromU:"",fromT:"",toU:"",toT:"",via:"",se:null,rsn:"",push:false,ua:"",
           _sdp:{has:false,dir:"sendrecv",conn:"",aport:null,savp:false,codecs:[]},_clen:null};
         phase="head";
@@ -725,11 +873,30 @@ function parserWorker(){
         if(phase==="bodymaybe"){
           if(/^v=0/.test(trimmed)){ phase="body"; cur._sdp.has=true; }
           else if(trimmed===""){ /* keep */ }
+          else if(/<reginfo\b|urn:ietf:params:xml:ns:reginfo/i.test(trimmed)){
+            // reginfo NOTIFY body — registration-state event. Calibrated on healthy traces:
+            // full-state NOTIFYs routinely list OLD terminated contacts alongside the new
+            // active one, so "active" anywhere in the body wins; only a body with bad events
+            // and NO active contact means the device really lost its registration.
+            const bad=/event="(unregistered|deactivated|expired|rejected|probation)"/i.exec(trimmed);
+            const ok=/state="active"|event="(registered|created|refreshed)"/i.test(trimmed);
+            if(ok) cur.regevt="active";
+            else if(bad && cur.regevt!=="active") cur.regevt=bad[1].toLowerCase();
+            else if(/state="terminated"/i.test(trimmed) && !cur.regevt) cur.regevt="terminated";
+            phase="body"; return;
+          }
           else { finalize(cur,out); cur=null; phase="idle"; emitLine(text,absStart,absEnd); }
           return;
         }
         if(phase==="body"){
           if(trimmed===""){ finalize(cur,out); cur=null; phase="idle"; return; }
+          if(!cur._sdp.has && /<reginfo\b|urn:ietf:params:xml:ns:reginfo|event="(unregistered|deactivated|expired|registered|created)"|state="(terminated|active)"/i.test(trimmed)){
+            const bad=/event="(unregistered|deactivated|expired|rejected|probation)"/i.exec(trimmed);
+            const ok=/state="active"|event="(registered|created|refreshed)"/i.test(trimmed);
+            if(ok) cur.regevt="active";
+            else if(bad && cur.regevt!=="active") cur.regevt=bad[1].toLowerCase();
+            else if(/state="terminated"/i.test(trimmed) && !cur.regevt) cur.regevt="terminated";
+          }
           const s=cur._sdp;
           if(/^[a-z]=/.test(trimmed)) s.has=true;
           if(/^c=IN\s+IP4\s+/.test(trimmed)){ const m=/c=IN\s+IP4\s+([0-9.]+)/.exec(trimmed); if(m) s.conn=m[1]; }
@@ -755,17 +922,47 @@ function parserWorker(){
         recentMeta2=recentMeta; recentMeta=text.length<400?text:text.slice(0,400);
         let cat=null;
         const errish=/(error|fail\w*|reject\w*|denied|timed?\s*out|timeout|unreachable|unavailable|invalid|expired|congest\w*|critical|alarm|disconnect|abort\w*|out of service|no\s*(media|audio|packets))/i.test(text);
-        const isPush=/\bNSI_CONN_MANAGER\b|\bIMS:NSI\b|\b(apns|fcm|gcm|vapid|pushkit|pnsregister|wpns)\b|push[-_ ]?(notification|token|gateway|service|request|wakeup|wake-up)/i.test(text);
+        const isPush=/\bNSI_CONN_MANAGER\b|\bIMS:NSI\b|\b(apns|fcm|gcm|vapid|pushkit|pnsregister|wpns)\b|push[-_ ]?(notification|token|gateway|service|request|wakeup|wake-up)/i.test(text)
+          || /api\.push\.apple\.com|googleapis\.com|data:gcm|CPpcscf_ns_|sendXmppMsg|apns_topic|apns_push_type/i.test(text)
+          // FCM HTTP v1 (newer Google push): NSI decodes the HTTP/2 exchange line-by-line.
+          || /sendNotification:|handleOneHttpMsg|Header:\s*:(status|method|path|authority|scheme)|messages:send|projects\/[a-z0-9_-]+\/messages\/|"message"\s*:\s*\{\s*"token"|APA91b|"MDN"\s*:|pcscf-ipv4-addr|access_token is /i.test(text);
+        // Learned from real traces: platform is identifiable per line —
+        //   Apple: api.push.apple.com / apns_* / bundle_id      Google: gcm|fcm.googleapis.com / data:gcm XMPP
+        //   Google FCM HTTP v1: POST /v1/projects/{proj}/messages:send to fcm.googleapis.com,
+        //   payload {"message":{"token":"APA91b…","data":{…"MDN":"+1…"}}}, receipt "projects/…/messages/…"
+        const pushPlat = /api\.push\.apple\.com|apns_|apple/i.test(text) ? "apple"
+                       : /gcm\.googleapis|fcm[-.]xmpp|googleapis\.com|data:gcm|"message_type"|sendXmppMsg|messages:send|projects\/[a-z0-9_-]+\/messages\/|"message"\s*:\s*\{\s*"token"|APA91b|oauth2\.googleapis|token_uri/i.test(text) ? "google" : "";
+        // Which Google transport? Legacy XMPP stream vs newer HTTP v1 POST. Both kept.
+        const pushXport = /data:gcm|"message_type"|sendXmppMsg|<stream:stream|jabber:client|fcm-xmpp/i.test(text) ? "xmpp"
+                        : /messages:send|handleOneHttpMsg|sendNotification:\s*the decoded|Header:\s*:(status|method|path|authority|scheme)|projects\/[a-z0-9_-]+\/messages\/|HTTP2 stream-id|:path:\s*\/v1\/projects/i.test(text) ? "http" : "";
+        // OAuth token acquisition sub-flow (AFED/FEPH -> Google OAuth). No token => POST is skipped.
+        const oauth = FCM_OAUTH.markers.test(text);
+        const oauthErr = oauth && FCM_OAUTH.errMarkers.test(text);
+        // Google FCM project id from the request path or receipt.
+        const projM=/projects\/([a-z0-9-]+)\/messages/i.exec(text);
+        // GCM/FCM payloads (XMPP and HTTP v1 alike) carry the target: "MDN":"+1XXXXXXXXXX" — exact push↔call correlation.
+        const mdnM=/"MDN"\s*:\s*"(\+?\d{6,15})"/.exec(text);
+        // Retry counter carried in the payload ("count":"N") — rising N = a retry of one logical push.
+        const cntM=/"count"\s*:\s*"?(\d+)"?/.exec(text);
+        const gcmAck=/"message_type"\s*:\s*"ack"/i.test(text)
+          || /projects\/[a-z0-9_-]+\/messages\/[0-9A-Za-z%:._-]+/.test(text)          // FCM v1 delivery receipt (message name)
+          || /Header:\s*:status:\s*2\d\d\b/i.test(text);                              // HTTP/2 2xx from the push service
+        const gcmNack=/"message_type"\s*:\s*"nack"/i.test(text)
+          || /Header:\s*:status:\s*[45]\d\d\b/i.test(text);                            // HTTP/2 4xx/5xx from the push service
+        const gcmErr=/"error"\s*:\s*"([A-Za-z_]+)"/.exec(text)
+          || /"status"\s*:\s*"(UNREGISTERED|SENDER_ID_MISMATCH|QUOTA_EXCEEDED|INVALID_ARGUMENT|THIRD_PARTY_AUTH_ERROR|UNAVAILABLE|INTERNAL|PERMISSION_DENIED|NOT_FOUND)"/.exec(text);
+        // FCM/OAuth PM counter or alarm token present on this line?
+        const pmTok=/\bVS\.(PCSCF|FEPH)?FCM[A-Za-z]+\b|LSS_missingFCMAuthData|FCMPOSTReqErrRate|LSS_cpiFCMXMPPReqErrRate/.exec(text);
         // Calibrated against real logs: "wait the query", "err(0)", "errro value is 0",
         // "ret_val(0)", "Succeeded"/"successfully" are NORMAL push lines, not failures.
-        const pushBenign=/wait the query|err\(0\)|errro?\s*value\s*is\s*0\b|ret_val\(0\)|succeed|successfully|already been scheduled|doing tls write|bytes_read is \d+|resolvefqdn/i.test(text);
+        const pushBenign=/wait the query|err\(0\)|errro?\s*value\s*is\s*0\b|ret_val\(0\)|succe(ed|ss)\w*|already been scheduled|doing tls write|bytes_read is \d+|resolvefqdn|ttl timer|nsipipe_timeout|handlettltimeout|processttldnsresponse|history-info|hnr container|idle timer|name length:|value length:|stream id:\s*\d+,\s*length|access_token is |bearer ya29/i.test(text);
         const pushBad=/fail(ed|ure)?\s+to|cannot|unable|err\([1-9]|ret_val\([1-9]|errro?\s*value\s*is\s*[1-9]|reset by peer|refused|closed|broken|timed?\s*out|timeout|no\s*route|unreach\w*|bad\s*device\s*token|invalid\s*token|token\s*(expired|invalid|missing)|no\s*token|unregister\w*|not\s*registered|certificate|handshake|\b(429|500|502|503)\b|reject\w*|delivery\s*fail\w*/i.test(text);
         const pushOk=/sendNotification\(\):\s*successfully send out steam|Succeeded to send a message to notification server|successfully send out steam/i.test(text);
         // media: only flag genuine media-plane failures, not any line that merely contains a codec name + the word "invalid"
-        const mediaErr=/(rtp|rtcp|srtp|media)\s*(timeout|inactiv\w*|fail\w*|lost|stopp?ed|drop\w*)|no\s*(media|audio|rtp|packets)|one[-\s]?way|dead\s*air|packet[-\s]?loss|high\s*jitter|codec\s*(mismatch|unsupported|negotiat\w*\s*fail\w*)|transcod\w*\s*(fail\w*|error)|dsp\s*(fail\w*|error|exhaust\w*)/i.test(text);
+        const mediaErr=/(rtp|rtcp|srtp|media)\s+(timeout|inactiv\w*|fail\w*|lost|stopp?ed|drop\w*)|no\s+(media|audio|rtp|packets)\b(?!sec)|one[-\s]way\s+(media|audio)|dead\s*air|packet[-\s]?loss|high\s*jitter|codec\s*(mismatch|unsupported|negotiat\w*\s*fail\w*)|transcod\w*\s*(fail\w*|error)|dsp\s*(fail\w*|error|exhaust\w*)/i.test(text);
         if(/\b(h\.?248|megaco)\b/i.test(text) || /\bServiceChange\b/i.test(text) || /\bMEGACO\//i.test(text) || /H\.248 message (from|to) Gateway/i.test(text) || /\b(Context|Termination)\s*[=:]/i.test(text) || /\b(ADD|MODIFY|SUBTRACT|MOVE|AuditValue|AuditCapability|Notify)\b.*\b(Context|Termination|TerminationID|req|reply|=)\b/i.test(text)){
           cat="h248";
-        } else if(isPush){
+        } else if(isPush || oauth || pmTok){
           cat="push";
         } else if(/\b(RTP|RTCP|SRTP)\b/i.test(text) || /\b(codec|transcod\w*|jitter|packet[-\s]?loss|MOS\b|DSP\b|media\s*(flow|inactiv\w*|timeout|stat\w*)|one[-\s]?way|no\s*audio|dead\s*air|voice\s*(quality|path)|G\.7\d\d|PCMU|PCMA|telephone-event|amr\b|opus)\b/i.test(text)){
           cat="media";
@@ -776,8 +973,25 @@ function parserWorker(){
         }
         if(cat){
           const cnt=(evCounts[cat]=(evCounts[cat]||0)+1);
-          const isErr = cat==="push" ? (pushBad && !pushBenign) : cat==="media" ? mediaErr : errish;
-          if(cnt<=EV_CAP[cat]) events.push({cat,err:isErr,ok:(cat==="push"&&pushOk)||undefined,ln:lineNo,s:absStart,e:absEnd,text:text.length<280?text:text.slice(0,280)+"\u2026"});
+          // an FCM alarm token is always significant; OAuth failure is an error; else the usual push rules
+          const alarmTok=pmTok&&/LSS_missingFCMAuthData|FCMPOSTReqErrRate/.test(pmTok[0]);
+          let isErr = cat==="push" ? ((pushBad && !pushBenign) || gcmNack || (gcmErr&&!gcmAck) || oauthErr || alarmTok) : cat==="media" ? mediaErr : errish;
+          if(cnt<=EV_CAP[cat]){
+            const ev={cat,err:isErr,ok:(cat==="push"&&(pushOk||gcmAck)&&!oauthErr)||undefined,ln:lineNo,s:absStart,e:absEnd,text:text.length<280?text:text.slice(0,280)+"\u2026"};
+            if(cat==="push"){
+              if(pushPlat) ev.plat=pushPlat;
+              if(pushXport) ev.xport=pushXport;       // "xmpp" | "http" (Google transport generation)
+              if(mdnM) ev.mdn=mdnM[1];
+              if(cntM) ev.cnt=parseInt(cntM[1],10);   // payload retry counter
+              if(projM) ev.proj=projM[1];             // FCM project id
+              if(gcmAck) ev.ack=true;
+              if(gcmNack||gcmErr) ev.nack=gcmErr?gcmErr[1]:"nack";
+              if(oauth) ev.oauth=true;
+              if(oauthErr) ev.oautherr=true;
+              if(pmTok) ev.pm=pmTok[0];               // PM counter / alarm token
+            }
+            events.push(ev);
+          }
           else evTrunc[cat]=true;
         }
       } else { recentMeta2=recentMeta; recentMeta=""; }
@@ -916,8 +1130,9 @@ function finishLoad(){
     return;
   }
   // Did the platform actually dispatch a push to the notification server? (NSI_CONN_MANAGER)
-  state.pushDispatched = state.events.some(e=>e.cat==="push" && (e.ok || /Succeeded to send a message to notification server|successfully send out steam|sendNotification\(\)\s*:/i.test(e.text)));
-  state.pushSends = state.events.filter(e=>e.cat==="push" && (e.ok || /Succeeded to send a message to notification server|successfully send out steam/i.test(e.text))).length;
+  state.pushDispatched = state.events.some(e=>e.cat==="push" && (e.ok || e.mdn || /Succeeded to send a message to notification server|successfully send out steam|sendNotification\(\)\s*:/i.test(e.text)));
+  const mdnSends = state.events.filter(e=>e.cat==="push" && e.mdn).length;
+  state.pushSends = mdnSends || state.events.filter(e=>e.cat==="push" && (e.ok || /Succeeded to send a message to notification server|successfully send out steam/i.test(e.text))).length;
   state.pushResponses = state.events.filter(e=>e.cat==="push" && /sslRead[\s\S]*bytes_read is [1-9]/i.test(e.text)).length;
   state.pushErrors = state.events.filter(e=>e.cat==="push" && e.err).length;
   buildCalls();
@@ -957,7 +1172,7 @@ function regInfo(c){
   return {aor,inst,contact,expires,deregister,status,detail,attempts:reReg};
 }
 function summarizeGroup(cid,g){
-  const c={cid,msgs:g.msgs,first:g.firstIdx,fromU:"",toU:"",ts:"",methods:new Set(),codes:new Set(),maxClass:0,flags:[],severity:0,push:false,initFu:"",initFt:"",hasInvite:g.hasInvite};
+  const c={cid,msgs:g.msgs,first:g.firstIdx,fromU:"",toU:"",ts:"",methods:new Set(),codes:new Set(),maxClass:0,flags:[],severity:0,push:false,initFu:"",initFt:"",hasInvite:g.hasInvite,reasons:[],regEvts:[],legs:new Set()};
   for(const i of g.msgs){
     const m=state.messages[i];
     if(!c.ts&&m.t) c.ts=m.t;
@@ -966,6 +1181,9 @@ function summarizeGroup(cid,g){
     if(m.k==="req"){ c.methods.add(m.m); if(m.m==="INVITE"&&!c.initFu){ c.initFu=m.fu; c.initFt=m.ft; } }
     if(m.k==="res"){ c.codes.add(m.c); c.maxClass=Math.max(c.maxClass,Math.floor(m.c/100)); }
     if(m.push) c.push=true;
+    if(m.rsn) c.reasons.push(m.rsn);
+    if(m.regevt) c.regEvts.push(m.regevt);
+    if(m.leg) c.legs.add(m.leg);
   }
   if(c.methods.has("REGISTER")&&!c.hasInvite) c.regInfo=regInfo(c);
   return c;
@@ -1027,6 +1245,12 @@ function detectCallIssues(c){
   const msgs=c.msgs.map(i=>state.messages[i]);
   const codes=c.codes, methods=c.methods, has=x=>codes.has(x);
   const hasInvite=methods.has("INVITE");
+  // ---- common failure-cause database (learned from real Nokia SBC traces) ----
+  if(hasInvite||c.regEvts.length){
+    for(const fd of FAIL_DB){
+      try{ if(fd.test(c)) addFlag(c,fd.sev,fd.kind,fd.title(c)+" \u2014 "+fd.text(c)); }catch(e){}
+    }
+  }
   // ---- REGISTER-specific troubleshooting (non-call registration dialogs) ----
   if(c.regInfo){
     const ri=c.regInfo;
@@ -1042,8 +1266,8 @@ function detectCallIssues(c){
   const hasCancel=methods.has("CANCEL"), hasBye=methods.has("BYE");
   if(has(488)||has(606)||has(415)) addFlag(c,3,"media","Media/codec negotiation failed (488/415/606) \u2014 likely no audio or one-way audio. Check codec & SRTP/RTP profile across the two legs.");
   if(has(408)||has(504)) addFlag(c,3,"timeout","Request timed out (408/504) \u2014 a downstream element didn't respond (down / unreachable / overloaded).");
-  if(has(503)) addFlag(c,2,"routing","Service Unavailable (503) \u2014 next hop overloaded or in maintenance; check failover routing.");
-  if(has(404)||has(604)) addFlag(c,2,"routing","Number/route not found (404/604) \u2014 dial-plan / routing miss.");
+  if(has(503)&&!c.flags.some(f=>/503/.test(f.text))) addFlag(c,2,"routing","Service Unavailable (503) \u2014 next hop overloaded or in maintenance; check failover routing.");
+  if((has(404)||has(604))&&!c.flags.some(f=>/404, Q\.850/.test(f.text))) addFlag(c,2,"routing","Number/route not found (404/604) \u2014 dial-plan / routing miss.");
   if(has(403)) addFlag(c,2,"routing","Forbidden (403) \u2014 policy/trust rejection (source IP not trusted or route not provisioned).");
   if(has(480)) addFlag(c,1,"routing","Temporarily Unavailable (480) \u2014 target not accepting calls right now.");
   if(has(486)||has(600)) addFlag(c,1,"info","Busy (486/600) \u2014 callee busy.");
@@ -1054,7 +1278,6 @@ function detectCallIssues(c){
   if(has(481)) addFlag(c,2,"state","Dialog/transaction does not exist (481) \u2014 the two sides are out of sync; can drop or wedge the call.");
   if(has(482)||has(483)) addFlag(c,2,"routing","Routing loop (482/483) \u2014 check Via chain / Max-Forwards.");
   if(hasInvite&&!got2xx&&!hasCancel&&![...codes].some(x=>x>=300)) addFlag(c,2,"timeout","INVITE never received a final response \u2014 setup did not complete.");
-  if(hasCancel&&has(487)) addFlag(c,0,"info","Caller cancelled before answer (CANCEL \u2192 487). Usually a normal abandoned call.");
   let sawDir=false,savpSeen=false,avpSeen=false;
   for(const m of msgs){
     if(m.sdp){
@@ -1072,7 +1295,12 @@ function detectCallIssues(c){
   if(got2xx&&hasBye){
     const ans=msgs.find(m=>m.k==="res"&&m.c>=200&&m.c<300&&m.cm==="INVITE");
     const bye=msgs.find(m=>m.m==="BYE");
-    if(ans&&bye){ const d=tsDiff(ans.t,bye.t); if(d!=null&&d>=0&&d<8) addFlag(c,2,"media","Call dropped within "+d.toFixed(1)+"s of being answered \u2014 strong sign of a media failure (no RTP)."); }
+    if(ans&&bye){ const d=tsDiff(ans.t,bye.t);
+      // Learned from real good-call traces: scripted/short calls end with a BYE carrying
+      // Reason: USER;cause=101 "USER triggered" or Q.850 cause 16 (normal clearing) — a
+      // deliberate hangup, not a media failure. Only flag short calls without such a reason.
+      const deliberate=c.reasons.some(r=>/USER\s*triggered|cause=16\b|user;cause=1\d\d|normal\s*(call\s*)?clearing/i.test(r));
+      if(d!=null&&d>=0&&d<8&&!deliberate) addFlag(c,2,"media","Call dropped within "+d.toFixed(1)+"s of being answered \u2014 strong sign of a media failure (no RTP)."); }
   }
   if(c.push&&hasInvite&&!got2xx) addFlag(c,2,"push","Push-registered endpoint (pn- Contact) with no answer \u2014 suspect a push-notification wake-up failure (device never alerted).");
 }
@@ -1084,13 +1312,51 @@ function correlatePushFailures(){
   if(!state.pushDispatched) return;
   const digits=s=>(s||"").replace(/^sips?:/i,"").replace(/^tel:/i,"").replace(/[^0-9]/g,"");
   const mobileTgt=s=>/^tel:/i.test(s||"")||/^\+?\d{6,}/.test((s||"").replace(/^sips?:/i,""));
+  // EXACT correlation: the GCM/FCM XMPP payload carries "MDN":"+1XXXXXXXXXX" — the target number.
+  // Index push events by MDN digits (last 10) so calls can be linked precisely, per platform.
+  const pushByMdn=new Map();
+  for(const e of state.events){
+    if(e.cat!=="push"||!e.mdn) continue;
+    const k=digits(e.mdn).slice(-10); if(!k) continue;
+    if(!pushByMdn.has(k)) pushByMdn.set(k,[]);
+    pushByMdn.get(k).push(e);
+  }
+  state.pushByMdn=pushByMdn;
   const succeeded=new Set();
   for(const c of state.calls.values()){ if([...c.codes].some(x=>x>=200&&x<300)){ const n=digits(c.toU); if(n) succeeded.add(n); } }
   for(const c of state.calls.values()){
     const codes=c.codes, got2xx=[...codes].some(x=>x>=200&&x<300);
+    const n=digits(c.toU), k=n.slice(-10);
+    // annotate every call that has a matching push dispatch (exact, by MDN)
+    if(k&&pushByMdn.has(k)){
+      const evs=pushByMdn.get(k);
+      c.pushEvs=evs.map(e=>e.ln);
+      c.pushPlat=evs.find(e=>e.plat)?evs.find(e=>e.plat).plat:"";
+      c.pushXport=evs.find(e=>e.xport)?evs.find(e=>e.xport).xport:"";
+      const acked=evs.some(e=>e.ack)||state.events.some(e=>e.cat==="push"&&e.ack);
+      // Look for a decisive FCM v1 error among this call's push events (exact, per-call cause).
+      let v1=null; for(const e of evs){ const d=fcmV1Decode(e.text); if(d){ v1=d; break; } }
+      const oautherr=evs.some(e=>e.oautherr);
+      if(!got2xx&&c.methods.has("INVITE")&&!(n&&succeeded.has(n))){
+        const noFinal=![...codes].some(x=>x>=200);
+        const ended=codes.has(408)?"408 timeout":codes.has(480)?"480":noFinal?"no final response":"";
+        if(codes.has(408)||codes.has(480)||codes.has(504)||noFinal){
+          if(v1){
+            const rt=v1.retry===true?"the SBC retried once and it still failed":v1.retry==="backoff"?"FCM is rate-limiting (429) and the SBC backs off for a minute":"no retry is attempted for this error";
+            addFlag(c,3,"push","Push wake-up failure \u2014 FCM v1 rejected the push for MDN "+evs[0].mdn+" with "+(v1.code||"")+" "+v1.status+" ("+rt+"). "+v1.t+" The call ended in "+ended+". "+(v1.status==="UNREGISTERED"?"Root cause: the device\u2019s FCM token is dead \u2014 the client must register a NEW token before calls can reach it.":v1.status==="SENDER_ID_MISMATCH"?"Root cause: app\u2192FCM-project mapping mismatch (wrong project for this token).":v1.status==="QUOTA_EXCEEDED"?"Root cause: FCM throttling \u2014 likely affecting many subscribers, not just this one.":v1.status==="INVALID_ARGUMENT"?"Root cause: the SBC built an invalid push (token format / payload size / TTL).":"See the Push tab entry for the exact cause."));
+          } else if(oautherr){
+            addFlag(c,3,"push","Push NOT sent \u2014 no valid Google OAuth access token when this call needed a push for MDN "+evs[0].mdn+". The SBC skipped the FCM POST entirely, so the device was never paged and the call ended in "+ended+". This is a credential/OAuth problem (Service Account Private Key or connectivity to oauth2.googleapis.com), not a device problem \u2014 and it typically breaks push for ALL subscribers of that app until fixed.");
+          } else {
+            addFlag(c,3,"push","Push wake-up failure (EXACT match): "+(c.pushPlat==="apple"?"an Apple (APNs)":c.pushPlat==="google"?("a Google FCM"+(c.pushXport==="http"?" HTTP v1":c.pushXport==="xmpp"?" XMPP":"")):"a")+" push carrying MDN "+evs[0].mdn+" was dispatched for this callee (log line "+evs[0].ln+")"+(acked?" and the push service accepted it,":",")+" but the device never answered \u2014 the call ended in "+ended+". The push chain worked up to "+(acked?"the push service (device-side problem: app killed, no data, battery optimization, stale token)":"the SBC send (verify the push service accepted it)")+".");
+          }
+          continue;
+        }
+      }
+      if(got2xx&&!c.flags.some(f=>f.kind==="push")) c.pushOkStory=true; // healthy: push → device woke → answered
+    }
     if(got2xx || c.flags.some(f=>f.kind==="push")) continue;
     if(!c.methods.has("INVITE") || !mobileTgt(c.toU)) continue;
-    const n=digits(c.toU); if(n && succeeded.has(n)) continue;          // another leg answered \u2192 not a push failure
+    if(n && succeeded.has(n)) continue;          // another leg answered \u2192 not a push failure
     const noFinal=![...codes].some(x=>x>=200);
     if(codes.has(408)||codes.has(480)||codes.has(504)||noFinal)
       addFlag(c,3,"push","Inbound call to a mobile/E.164 endpoint went unanswered ("+(codes.has(408)?"408 timeout":codes.has(480)?"480 unavailable":noFinal?"no final response":"timeout")+") while push activity (IMS:NSI_CONN_MANAGER) is present in this log \u2014 the device was paged via push but never woke or re-registered to take the call. This is the signature of a push-notification wake-up failure; correlate the NSI send on the Push tab around this time.");
@@ -1227,10 +1493,19 @@ function renderStats(){
   if(state.tab==="push"){
     const p=state.evCounts.push||0;
     const sends=state.pushSends||0, resp=state.pushResponses||0, perr=state.pushErrors||0;
+    const apple=state.events.filter(e=>e.cat==="push"&&e.plat==="apple").length;
+    const goog=state.events.filter(e=>e.cat==="push"&&e.plat==="google").length;
+    const acks=state.events.filter(e=>e.cat==="push"&&e.ack).length;
+    const httpG=state.events.filter(e=>e.cat==="push"&&e.xport==="http").length;
+    const xmppG=state.events.filter(e=>e.cat==="push"&&e.xport==="xmpp").length;
+    const oauthErr=state.events.some(e=>e.cat==="push"&&e.oautherr);
+    const fcmAlarm=state.events.some(e=>e.cat==="push"&&fcmGlossary(e.text)&&fcmGlossary(e.text).kind==="alarm");
     const pushCalls=[...state.calls.values()].filter(c=>c.flags.some(f=>f.kind==="push")).length;
-    const tiles = pushCalls>0
-      ? stat(sends.toLocaleString(),"pushes sent")+stat(pushCalls.toLocaleString(),"wake-up failures",true)+stat(perr.toLocaleString(),"send errors")+stat(p.toLocaleString(),"push log lines")
-      : stat(sends.toLocaleString(),"pushes sent")+stat(resp.toLocaleString(),"server replies")+stat(perr.toLocaleString(),"send errors")+stat(p.toLocaleString(),"push log lines");
+    const gxport=(httpG||xmppG)?((httpG?"HTTPv1":"")+(httpG&&xmppG?"+":"")+(xmppG?"XMPP":"")):"\u2014";
+    let tiles;
+    if(oauthErr||fcmAlarm) tiles=stat(sends.toLocaleString(),"pushes sent")+stat("!",oauthErr?"OAuth token fail":"FCM alarm",true)+stat((apple||goog)?(apple+" / "+goog):"\u2014","apple / google")+stat(perr.toLocaleString(),"send errors");
+    else if(pushCalls>0) tiles=stat(sends.toLocaleString(),"pushes sent")+stat(pushCalls.toLocaleString(),"wake-up failures",true)+stat((apple||goog)?(apple+" / "+goog):"\u2014","apple / google")+stat(gxport,"google xport");
+    else tiles=stat(sends.toLocaleString(),"pushes sent")+stat(acks?acks.toLocaleString():resp.toLocaleString(),acks?"push accepts":"server replies")+stat((apple||goog)?(apple+" / "+goog):"\u2014","apple / google")+stat(gxport,"google xport");
     $("statGrid").innerHTML=tiles;
     return;
   }
@@ -1363,10 +1638,11 @@ const msgList=VirtualList($("msgScroll"),$("msgVlist"),36,()=>state.filtered.len
     if(m.k==="req") sum='<span style="color:var(--text)">'+esc(m.m)+'</span><span class="arrow">\u203a</span>'+esc(shortUri(m.ruri));
     else sum=esc(m.rt||"")+' <span style="color:var(--text-faint)">('+esc(m.cm||"")+')</span>';
     const sel=state.selected===idx?" sel":"";
+    const legB=m.leg?('<span class="legb '+m.leg+'" title="'+(m.leg==="access"?"Access side (device leg)":"Core side (network leg)")+'">'+(m.leg==="access"?"ACC":"CORE")+'</span>'):"";
     html+='<div class="vrow" style="top:'+(r*rh)+'px;height:'+rh+'px"><div class="msgrow'+sel+'" data-idx="'+idx+'">'+
       '<div class="stripe" style="background:'+stripe+'"></div>'+
       '<div class="ln">'+m.ln+'</div><div class="ts">'+esc(m.t||"")+'</div><div class="dir">'+dir+'</div>'+
-      '<div class="bdg">'+badgeHTML(m)+'</div><div class="sum">'+sum+'</div>'+
+      '<div class="bdg">'+badgeHTML(m)+legB+'</div><div class="sum">'+sum+'</div>'+
       '<div class="cid" title="'+esc(m.cid)+'">'+esc(shortCid(m.cid))+'</div>'+
       '<button class="ask" data-idx="'+idx+'" data-ask="1" title="What does this mean?">?</button>'+
       '</div></div>';
@@ -1410,7 +1686,8 @@ async function renderDetail(idx){
         '<span class="k">CSeq</span><span class="v">'+(m.cseq!=null?m.cseq:"\u2014")+' '+esc(m.cm||"")+'</span>'+
         '<span class="k">From</span><span class="v">'+esc(m.fu||"\u2014")+'</span>'+
         '<span class="k">To</span><span class="v">'+esc(m.tu||"\u2014")+'</span>'+
-        ((m.src||m.dst)?'<span class="k">Path</span><span class="v">'+esc(m.src||"?")+' \u2192 '+esc(m.dst||"?")+'</span>':"")+
+        ((m.src||m.dst)?'<span class="k">Path</span><span class="v">'+esc(m.src||"?")+' \u2192 '+esc(m.dst||"?")+(m.proto?' <span style="color:var(--text-faint)">'+esc(m.proto)+'</span>':'')+(m.leg?' <span class="legb '+m.leg+'">'+(m.leg==="access"?"ACCESS":"CORE")+'</span>':'')+'</span>':"")+
+        (m.regevt&&m.regevt!=="active"?'<span class="k">Reg event</span><span class="v" style="color:var(--warn)">reginfo: '+esc(m.regevt)+' \u2014 the registration binding ended</span>':"")+
         (m.via?'<span class="k">Via</span><span class="v">'+esc(m.via)+'</span>':"")+
         (m.ua?'<span class="k">UA</span><span class="v">'+esc(m.ua)+'</span>':"")+
         (m.se?'<span class="k">Sess-Exp</span><span class="v">'+esc(m.se)+'</span>':"")+
@@ -1427,6 +1704,8 @@ async function renderDetail(idx){
       '</div>'):
       ('<div class="flag info" style="margin-top:12px"><span class="ic">\u2139</span><span>This Call-ID has no INVITE in the log, so it isn\u2019t grouped as a call. It still appears in the message stream, just not in the Calls list.</span></div>'))+
       (isCall&&c&&c.regCid?('<div class="flag '+(c.regLinked.status==="ok"?"info":c.regLinked.status==="failed"?"crit":"warn")+'" style="margin-top:9px"><span class="ic">\u2317</span><span><b>Linked device registration:</b> '+esc(c.regLinked.detail)+' \u2014 AOR <span class="mono">'+esc(c.callerAor||"?")+'</span>'+(c.regBefore?'':' <i>(registration appears after this call in the log)</i>')+'. Focus this call to see the REGISTER inline in the stream.</span></div>'):'')+
+      (isCall&&c&&c.pushEvs&&c.pushEvs.length?('<div class="flag '+(c.flags.some(f=>f.kind==="push")?"crit":"info")+'" style="margin-top:9px"><span class="ic">\ud83d\udce8</span><span><b>Linked push notification'+(c.pushEvs.length>1?"s":"")+':</b> '+(c.pushPlat==="apple"?"Apple (APNs)":c.pushPlat==="google"?"Google (FCM/GCM)":"push")+' dispatch for this callee\u2019s MDN at log line'+(c.pushEvs.length>1?"s":"")+' '+c.pushEvs.slice(0,4).join(", ")+(c.pushOkStory?' \u2014 device woke and the call was answered \u2713':(c.flags.some(f=>f.kind==="push")?' \u2014 device never responded (see flags below)':''))+'. See the Push tab for the full sequence.</span></div>'):'')+
+      (isCall&&c&&c.legs&&c.legs.size?('<div class="flag info" style="margin-top:9px"><span class="ic">\u21c6</span><span><b>Legs seen:</b> '+[...c.legs].map(l=>'<span class="legb '+l+'">'+(l==="access"?"ACCESS (device side)":"CORE (network side)")+'</span>').join(" ")+(c.legs.size===1?' \u2014 only one side of the SBC appears in this dialog; the mate leg is under a different Call-ID (the SBC rewrites Call-IDs between legs).':' \u2014 this dialog carries both SBC sides.')+'</span></div>'):'')+
       '</div>'+
     '<div class="dsec"><h4>Raw message</h4><div class="rawbox" id="rawBox">loading\u2026</div></div>'+
     '<div class="dsec" id="analysisAnchor"><h4>What this means &amp; what to check</h4><div class="analysis">'+analyze(m,c)+'</div></div>';
@@ -1446,7 +1725,7 @@ async function readRaw(m){
 const EV_EXPLAIN={
   h248:"<b>H.248 / Megaco</b> is the protocol the SBC/MGC uses to control the media (border) gateway. These messages create, modify, and tear down <i>contexts</i> and <i>terminations</i> \u2014 i.e. they program the gateway to bridge RTP for a call. If these fail (a rejected ADD/MODIFY, a ServiceChange, an unreachable gateway), the call can complete in SIP but have <b>no media</b>, or drop when the gateway can\u2019t allocate a resource.",
   media:"<b>RTP / media / voice</b> is the actual audio path or statistics about it. Watch for RTP timeouts, packet loss, jitter, one-way media, and codec / transcoding issues \u2014 these are what users experience as no-audio, one-way audio, or choppy / robotic voice.",
-  push:"<b>Push notification</b> traffic wakes mobile clients for inbound calls (APNs / FCM, RFC 8599). On many SBC/IMS platforms the push subsystem logs under <span class=\"mono\">IMS:NSI_CONN_MANAGER</span> \u2014 these lines show the connection manager building the push request, opening the connection to the push gateway, and the delivery result. Failures (BadDeviceToken, expired/invalid token, unregistered device, connection reset, TLS/cert errors, 429/503 from the push gateway) mean the device is never alerted, so calls to it ring nowhere even though the SIP side looks healthy. Correlate a failure here with the INVITE to that AOR using \u201cNearest SIP message\u201d.",
+  push:"<b>Push notification</b> traffic wakes mobile clients for inbound calls (APNs / FCM, RFC 8599). It logs under <span class=\"mono\">IMS:NSI_CONN_MANAGER</span>. Google FCM has two generations \u2014 the older <b>XMPP</b> flow (stream to <span class=\"mono\">gcm / fcm-xmpp.googleapis.com</span>, JSON <span class=\"mono\">message_type ack/nack</span>) and the newer <b>HTTP v1</b> flow: an HTTP/2 <span class=\"mono\">POST /v1/projects/\u2026/messages:send</span> to <span class=\"mono\">fcm.googleapis.com</span>, authorized with a short-lived <b>OAuth Bearer token</b> the SBC fetches (\u2248hourly) from <span class=\"mono\">oauth2.googleapis.com</span>. HTTP v1 success = <span class=\"mono\">:status: 200</span> + a <span class=\"mono\">projects/\u2026/messages/\u2026</span> receipt; failures return a code+status (404 UNREGISTERED and 403 SENDER_ID_MISMATCH are fatal/no-retry, 500/503/timeout retry once, 429 QUOTA backs off). If the SBC has no valid OAuth token it SKIPS the POST entirely. Apple uses HTTP/2 to <span class=\"mono\">api.push.apple.com</span>. Both Google generations carry the target MDN, so Sip Scope links pushes to calls exactly and decodes the exact failure cause.",
   routing:"<b>Routing</b> events relate to how the SBC selects a next hop / trunk. Failures point to dial-plan, LCR, or trunk-group problems.",
   alarm:"A generic <b>error / alarm</b> line from the element\u2019s own logging."
 };
@@ -1470,6 +1749,17 @@ async function renderEventDetail(e){
     '<div class="dsec"><h4>Log line (with context)</h4><div class="rawbox" id="evRaw">loading\u2026</div></div>'+
     '<div class="dsec"><h4>What this is</h4><div class="analysis"><p>'+EV_EXPLAIN[e.cat]+'</p>'+
       ((e.cat==="h248"&&h248Decode(e.text))?('<div class="flag warn"><span class="ic">\u26a0</span><span><b>H.248 reply code '+h248Decode(e.text).code+'</b> \u2014 '+esc(h248Decode(e.text).t)+'</span></div>'):'')+
+      ((e.cat==="push"&&(e.plat||e.mdn||e.ack||e.nack||e.xport||e.proj))?('<div class="flag '+(e.nack?"crit":"info")+'"><span class="ic">\ud83d\udce8</span><span>'+
+        (e.plat?('<b>Platform:</b> '+(e.plat==="apple"?"Apple \u2014 APNs (api.push.apple.com, HTTP/2)":"Google \u2014 FCM"+(e.xport==="http"?" HTTP v1 (POST to fcm.googleapis.com/v1/projects/\u2026/messages:send)":e.xport==="xmpp"?" legacy XMPP flow":" (XMPP or HTTP v1)"))+'. '):'')+
+        (e.proj?('<b>FCM project:</b> <span class="mono">'+esc(e.proj)+'</span> (maps to the app/service in the client\u2019s P-Com.Service). '):'')+
+        (e.mdn?('<b>Target MDN:</b> <span class="mono">'+esc(e.mdn)+'</span> \u2014 this push wakes that number\u2019s device; find its INVITE on the Calls tab. '):'')+
+        (e.cnt!=null?('<b>Attempt #'+e.cnt+'</b> (payload count) \u2014 '+(e.cnt>1?"this is a retry of an earlier push for the same call.":"first attempt.")+' '):'')+
+        (e.ack?'<b>The push service accepted this message</b> (XMPP ack / HTTP v1 2xx + message receipt) \u2014 delivery to Google/Apple succeeded; anything failing after this point is device-side. ':'')+
+        (e.nack&&!fcmV1Decode(e.text)?('<b>The push service rejected it ('+esc(typeof e.nack==="string"?e.nack:"nack")+')</b> \u2014 the notification never reached the device. Common causes: stale/unregistered token, bad payload, throttling. '):'')+
+        '</span></div>'):'')+
+      ((e.cat==="push"&&fcmV1Decode(e.text))?(function(){var d=fcmV1Decode(e.text);var rt=d.retry===true?"The SBC retries this once.":d.retry==="backoff"?"The SBC stops sending on this connection for 1 minute (backoff).":"No retry \u2014 the SBC leaves the SIP request to time out.";return '<div class="flag '+(d.sev>=3?"crit":"warn")+'"><span class="ic">\u26a0</span><span><b>FCM v1 error '+esc(d.code||"")+(d.status?" "+esc(d.status):"")+'</b> \u2014 '+esc(d.t)+' <i>'+rt+'</i>'+((d.tips&&d.tips.length)?'<br><b>Check:</b> '+d.tips.map(esc).join(' \u00b7 '):'')+'</span></div>';})():'')+
+      ((e.cat==="push"&&e.oauth)?('<div class="flag '+(e.oautherr?"crit":"info")+'"><span class="ic">\ud83d\udd11</span><span><b>OAuth token '+(e.oautherr?"failure":"activity")+':</b> '+(e.oautherr?"the SBC could not obtain/refresh a Google access token \u2014 without a valid token it SKIPS the FCM POST entirely, so no Android push goes out and the call will time out. This is a credential/OAuth problem, not a device problem. Check the Service Account Private Key file and connectivity to oauth2.googleapis.com.":"the SBC fetches a short-lived OAuth Bearer token (\u2248hourly) from the Google OAuth server to authorize FCM HTTP v1 pushes. Normal housekeeping.")+'</span></div>'):'')+
+      ((e.cat==="push"&&fcmGlossary(e.text))?(function(){var g=fcmGlossary(e.text);return '<div class="flag '+(g.kind==="alarm"?(g.info.sev>=3?"crit":"warn"):"info")+'"><span class="ic">'+(g.kind==="alarm"?"\ud83d\udea8":"\ud83d\udcca")+'</span><span><b>'+(g.kind==="alarm"?"FCM alarm ":"FCM counter ")+esc(g.name)+'</b> \u2014 '+esc(g.info.t)+((g.info.tips&&g.info.tips.length)?'<br><b>Check:</b> '+g.info.tips.map(esc).join(' \u00b7 '):'')+'</span></div>';})():'')+
       (e.err?'<div class="flag crit"><span class="ic">\u2716</span><span>This line reports an error / failure. Correlate it with the SIP call active at the same time using \u201cNearest SIP message\u201d.</span></div>':'<div class="flag info"><span class="ic">\u2139</span><span>Informational gateway / media line. Use \u201cNearest SIP message\u201d to line it up with the call it belongs to.</span></div>')+
       '</div></div>';
   $("evJump").onclick=()=>{ const near=findNearestMsg(e.ln); if(near<0){ toast("No SIP message nearby"); return; } if(scrollToMsg(near)) toast("Jumped to nearest SIP message (line "+state.messages[near].ln+")"); };
@@ -1741,10 +2031,21 @@ const SCAN_TIPS={
     "Almost always bad credentials, a realm mismatch, or auth-nonce/clock skew.",
     "Check whether the SBC is rejecting or rewriting the binding (Contact) so the registrar never accepts it.",
     "Back-pressure: confirm the SBC isn\u2019t rate-limiting the AOR after repeated failures."]},
+  reg_terminated:{what:"A reginfo NOTIFY (the registration-event package the network sends to subscribed watchers) reported this device's binding as terminated / unregistered / expired / deactivated. From that moment the network can't deliver calls to it \u2014 later 404s or push-paging to the same number usually trace back to this event.",tips:[
+    "Check the event attribute: 'unregistered' = the device (or network) removed the binding; 'expired' = it failed to refresh in time (connectivity loss, app killed); 'deactivated' = the registrar removed it (administrative or forced re-auth); 'rejected' = re-registration was refused.",
+    "Correlate the timestamp with the device's data connectivity and any push activity \u2014 on push-based clients an expired binding is normal while asleep, and a push should wake it to re-REGISTER when a call arrives.",
+    "If calls to this number fail right after this event, the real question is why the wake-up (push \u2192 re-REGISTER) chain didn't run in time.",
+    "Watch for flapping: repeated terminated/registered cycles indicate unstable connectivity or an aggressive expiry timer."]},
   reg_callerunreg:{what:"This call was placed by a device whose most recent REGISTER failed or never completed. SBCs frequently reject or mis-route calls from an unregistered endpoint.",tips:[
     "Fix the registration first (see the Registration findings) \u2014 the call problem is usually downstream of it.",
     "Check whether the SBC requires a valid registration binding before accepting INVITEs from this realm.",
     "If calls must work without registration, verify the SBC\u2019s \u201cunregistered/guest\u201d policy for this trunk."]},
+  call_policy:{what:"The call was killed by the SBC's policy interface, not by SIP. On this platform the giveaway is a teardown Reason like SIP;cause=503;text=\"PO: AAA: \u2026 exp_result_code=NNNN\" \u2014 the SBC asked the policy server (PCRF over Gq'/Rx) to authorize media/bearer resources for the call and the answer (AAA) came back negative, so the SBC tore the call down with a 503 even though signaling was fine.",tips:[
+    "Decode the exp_result_code in the Reason header \u2014 e.g. 5021/5065 mean the subscriber has no valid IP-CAN/bearer session (device lost its data session), 5063 means the service isn't authorized for this subscriber, 3004 means the policy server is overloaded, 3002 means it's unreachable.",
+    "Check the Diameter (Gq'/Rx) link state between the SBC and the PCRF around this timestamp \u2014 look for AAR sent / AAA received in the DIAMETER facility lines.",
+    "If many calls fail this way at once, suspect the PCRF or the Diameter transport, not the subscribers.",
+    "If only this subscriber fails: verify their session/bearer on the PCRF and that the SDP (IP, codecs, bandwidth) passes the policy rules.",
+    "A 'PT:' prefix instead of 'PO:' points at the terminating-side policy check rather than the originating side."]},
   call_media:{what:"The two legs could not agree on a codec or media transport (488 / 415 / 606). The call may set up but have no audio or one-way audio.",tips:[
     "Compare the offered codec list and RTP profile (RTP/AVP vs RTP/SAVP) on both legs of the INVITE/200.",
     "If one leg is SRTP and the other plain RTP, enable SRTP\u2194RTP interworking or transcoding on the SBC.",
@@ -1803,7 +2104,7 @@ const SCAN_TIPS={
     "Check next-hop reachability and any provisional-only (100/180) dead-ends.",
     "Capture a wider window in case the final response is just outside it."]},
   call_push:{what:"The callee is a push-registered mobile device that was never alerted \u2014 the push wake-up likely failed, so the device never woke to receive the INVITE. Note that the push can succeed at the connection-manager layer (you'll see \u201cSucceeded to send a message to notification server\u201d / \u201csuccessfully send out steam\u201d in the Push tab) and the device still never responds; the proof of failure is the INVITE timing out (408) with no re-REGISTER from the device.",tips:[
-    "Open the Push tab: confirm the IMS:NSI_CONN_MANAGER send actually went out (sent OK) vs errored. If it sent OK but the call still timed out, the problem is past the SBC \u2014 at the push gateway (APNs/FCM) or on the device.",
+    "Open the Push tab: confirm the IMS:NSI_CONN_MANAGER send actually went out (sent OK) vs errored. Google FCM may use the older XMPP flow or the newer HTTP v1 flow (POST /v1/projects/\u2026/messages:send \u2192 :status: 200 + a projects/\u2026/messages/\u2026 receipt). If the send was accepted but the call still timed out, the problem is past the SBC \u2014 at the push gateway or on the device.",
     "Device-side causes: app killed/backgrounded with a stale push token, no data connectivity, battery optimization, or the device simply not re-registering in time.",
     "Token/gateway causes: expired/invalid/unregistered device token, push-gateway connection or certificate/TLS failure, or 429/503 throttling from APNs/FCM.",
     "Remember the SBC rewrites Call-ID between the access and core legs, so the timed-out INVITE may appear under a different Call-ID than the device's original \u2014 look for both legs to the same callee number.",
@@ -1818,6 +2119,21 @@ const SCAN_TIPS={
     "Connection reset/refused or TLS/certificate errors \u2192 the SBC/IMS can\u2019t reach the push gateway (APNs/FCM) \u2014 check egress, proxy, and certificates.",
     "429/503 from the push gateway \u2192 rate-limited or gateway issue; check retry/back-off.",
     "Correlate with the INVITE to the same AOR (Nearest SIP message) to confirm the call was waiting on this push."]},
+  push_fcmv1:{what:"Google FCM rejected the HTTP v1 push POST with a specific error. The HTTP status and JSON status name tell you the exact cause AND whether the SBC retries \u2014 a no-retry code means the device will not be reached on this attempt.",tips:[
+    "404 UNREGISTERED (no retry) \u2192 the device\u2019s FCM token is dead (app uninstalled / token expired); the client must register a NEW token.",
+    "403 SENDER_ID_MISMATCH (no retry) \u2192 the token belongs to a different FCM project than the one sending; check the app\u2192project mapping (P-Com.Service).",
+    "400 INVALID_ARGUMENT (no retry) \u2192 the SBC built a bad push (token format, payload >4096 bytes, or invalid TTL).",
+    "429 QUOTA_EXCEEDED (backoff) \u2192 FCM throttling; usually affects many subscribers \u2014 an operator/capacity issue.",
+    "500 INTERNAL / 503 UNAVAILABLE / timeout (1 retry) \u2192 transient FCM-side; confirm a retry followed and whether it succeeded."]},
+  push_oauth:{what:"The SBC could not obtain or refresh the short-lived Google OAuth access token that authorizes FCM HTTP v1 pushes. Without a token the SBC SKIPS the FCM POST entirely, so no Android push is sent and the call times out. This is a credential/OAuth problem, not a device problem \u2014 and it typically breaks push for every subscriber of that app.",tips:[
+    "Check the Service Account Private Key file is installed and readable for the app/service (per project).",
+    "Check connectivity from AFED/FEPH to the Google OAuth server (oauth2.googleapis.com) and DNS resolution of token_uri.",
+    "invalid_grant / invalid_client from the OAuth server \u2192 the key file or its clock/JWT is wrong; a valid key returns a token with a ~1h TTL.",
+    "Look for the LSS_missingFCMAuthData alarm and the FCM Token Error (VS.FEPHFCMTokenError) count."]},
+  push_alarm:{what:"An FCM-related fault alarm fired. These indicate push is broken at a platform level for one or more apps, so fix them before chasing individual failed calls.",tips:[
+    "LSS_missingFCMAuthData \u2192 the FCM CA cert, the Service Account Private Key (HTTP v1) or server-key+sender-id (XMPP), or a valid OAuth token is missing for an app \u2014 no pushes go out for it.",
+    "FCMPOSTReqErrRate \u2192 the FCM POST failure rate exceeded threshold (>10/20/30% over 5 min); localize whether it\u2019s connect errors, specific HTTP codes, or timeouts.",
+    "Correlate the alarm time with a spike in failed inbound calls to Android devices."]},
   gw_event:{what:"The media gateway control plane (H.248 / Megaco) logged an error. The SBC may be unable to program the gateway, so calls can set up in SIP but have no media or drop on resource failure.",tips:[
     "ServiceChange / gateway out-of-service \u2192 the gateway (or a virtual MG) bounced; check its health and the control association.",
     "Failed ADD/MODIFY \u2192 the gateway rejected a context/termination request; check resource/DSP exhaustion and capability mismatch.",
@@ -1843,6 +2159,7 @@ function classifyCall(c){
   if(/dropped within/.test(txt)) return {bucket:"media",key:"call_dropped",sev:c.severity,title:"Call dropped seconds after answer (no media)"};
   if(/BYE Reason mentions media/.test(txt)) return {bucket:"media",key:"call_dropped",sev:c.severity,title:"Call torn down on media / RTP timeout"};
   if(flags.some(f=>f.kind==="push")) return {bucket:"push",key:"call_push",sev:c.severity,title:"Push wake-up failure (device never alerted)"};
+  if(flags.some(f=>f.kind==="policy")) return {bucket:"call",key:"call_policy",sev:c.severity,title:flags.find(f=>f.kind==="policy").text.split(" \u2014 ")[0]};
   if(has(408)||has(504)) return {bucket:"call",key:"call_timeout",sev:c.severity,title:"Request timed out ("+[408,504].filter(has).join("/")+") \u2014 downstream not responding"};
   if(has(503)||has(480)) return {bucket:"call",key:"call_unavailable",sev:c.severity,title:"Service unavailable ("+[503,480].filter(has).join("/")+")"};
   if(has(403)) return {bucket:"call",key:"call_forbidden",sev:c.severity,title:"403 Forbidden \u2014 policy / trust rejection"};
@@ -1860,12 +2177,23 @@ function regEvidence(c){ const ri=c.regInfo; const reg=c.msgs.map(i=>state.messa
 function callEvidence(c){ const inv=c.msgs.map(i=>state.messages[i]).find(m=>m.k==="req"&&m.m==="INVITE"); const fin=lastFinal(c); return (c.fromU||"?")+" \u2192 "+(c.toU||"?")+(fin?" \u00b7 final "+fin:"")+(inv?" \u00b7 INVITE L"+inv.ln:""); }
 function buildScan(){
   const f=[];
-  for(const c of state.others.values()){ if(c.regInfo&&c.severity>=1){ const cl=classifyReg(c); f.push(Object.assign(cl,{cid:c.cid,nav:"group",evidence:regEvidence(c)})); } }
+  for(const c of state.others.values()){
+    if(c.regInfo&&c.severity>=1){ const cl=classifyReg(c); f.push(Object.assign(cl,{cid:c.cid,nav:"group",evidence:regEvidence(c)})); }
+    else if(!c.regInfo&&c.severity>=2&&c.regEvts&&c.regEvts.some(e=>e!=="active")){
+      f.push({bucket:"reg",key:"reg_terminated",sev:c.severity,cid:c.cid,nav:"group",title:"Registration terminated \u2014 reginfo reports '"+c.regEvts.filter(e=>e!=="active").join("', '")+"'",evidence:(c.fromU||"?")+" \u00b7 reginfo NOTIFY dialog"});
+    }
+  }
   for(const c of state.calls.values()){ if(c.severity>=2){ const cl=classifyCall(c); f.push(Object.assign(cl,{cid:c.cid,nav:"group",evidence:callEvidence(c)})); } }
   for(const e of state.events){
     if(!e.err) continue;
     if(e.cat==="media") f.push({bucket:"media",key:"media_event",sev:(/timeout|no\s*(media|audio)|one-?way/i.test(e.text)?3:2),cid:null,ln:e.ln,nav:"line",title:"Media error in gateway/voice log",evidence:e.text});
-    else if(e.cat==="push") f.push({bucket:"push",key:"push_event",sev:3,cid:null,ln:e.ln,nav:"line",title:"Push delivery error",evidence:e.text});
+    else if(e.cat==="push"){
+      const g=fcmGlossary(e.text), v1=fcmV1Decode(e.text);
+      if(g&&g.kind==="alarm") f.push({bucket:"push",key:"push_alarm",sev:g.info.sev||3,cid:null,ln:e.ln,nav:"line",title:"FCM alarm: "+g.name,evidence:e.text});
+      else if(e.oautherr) f.push({bucket:"push",key:"push_oauth",sev:3,cid:null,ln:e.ln,nav:"line",title:"FCM OAuth token failure \u2014 pushes cannot be sent",evidence:e.text});
+      else if(v1) f.push({bucket:"push",key:"push_fcmv1",sev:v1.sev||3,cid:null,ln:e.ln,nav:"line",title:"FCM v1 "+(v1.code||"")+" "+v1.status+" \u2014 "+v1.short,evidence:e.text});
+      else f.push({bucket:"push",key:"push_event",sev:3,cid:null,ln:e.ln,nav:"line",title:"Push delivery error",evidence:e.text});
+    }
     else if(e.cat==="h248") { const dec=h248Decode(e.text); f.push({bucket:"gw",key:"gw_event",sev:dec?dec.sev:3,cid:null,ln:e.ln,nav:"line",title:dec?("H.248 error "+dec.code+" \u2014 "+dec.t):"H.248 / gateway error",evidence:e.text}); }
   }
   f.sort((a,b)=>b.sev-a.sev);
